@@ -7,6 +7,8 @@ import org.jsoup.select.Elements;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Value;
+import org.springframework.boot.context.event.ApplicationReadyEvent;
+import org.springframework.context.event.EventListener;
 import org.springframework.mail.SimpleMailMessage;
 import org.springframework.mail.javamail.JavaMailSender;
 import org.springframework.scheduling.annotation.Scheduled;
@@ -79,6 +81,9 @@ public class VmRackStockMonitorTask {
     @Value("${vmrack.stock-monitor.email-to:342252328@qq.com}")
     private String emailTo;
 
+    @Value("${vmrack.stock-monitor.test-alert-on-start:false}")
+    private boolean testAlertOnStart;
+
     private Instant lastAlertAt = Instant.EPOCH;
 
     public VmRackStockMonitorTask(
@@ -90,6 +95,16 @@ public class VmRackStockMonitorTask {
                 .followRedirects(HttpClient.Redirect.NORMAL)
                 .version(HttpClient.Version.HTTP_1_1)
                 .build();
+    }
+
+    @EventListener(ApplicationReadyEvent.class)
+    public void sendTestAlertOnStart() {
+        if (!testAlertOnStart) {
+            return;
+        }
+
+        ProductStock testProduct = new ProductStock("L3.VPS 模拟有货测试", "立即使用", "库存紧张", "测试价格", true);
+        sendAlert("VMRack 三网精品有货测试", Collections.singletonList(testProduct));
     }
 
     @Scheduled(
@@ -207,11 +222,13 @@ public class VmRackStockMonitorTask {
 
     private void alert(List<ProductStock> availableProducts) {
         lastAlertAt = Instant.now();
+        sendAlert("VMRack 三网精品有货", availableProducts);
+    }
 
+    private void sendAlert(String title, List<ProductStock> availableProducts) {
         String productLine = availableProducts.stream()
                 .map(product -> product.getName() + " " + product.getPrice() + " " + product.statusText())
                 .collect(Collectors.joining("; "));
-        String title = "VMRack 三网精品有货";
         String message = productLine + "，马上去抢购：" + pageUrl;
 
         log.warn("\u0007{} - {}", title, message);
