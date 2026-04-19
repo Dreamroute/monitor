@@ -7,6 +7,8 @@ import org.jsoup.select.Elements;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Value;
+import org.springframework.mail.SimpleMailMessage;
+import org.springframework.mail.javamail.JavaMailSender;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Component;
 import org.springframework.util.StringUtils;
@@ -19,6 +21,8 @@ import java.net.http.HttpResponse;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.time.Instant;
+import java.time.LocalDateTime;
+import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.LinkedHashMap;
@@ -33,8 +37,10 @@ public class VmRackStockMonitorTask {
     private static final Logger log = LoggerFactory.getLogger(VmRackStockMonitorTask.class);
     private static final String USER_AGENT = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
             + "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36";
+    private static final DateTimeFormatter DATE_TIME_FORMATTER = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss");
 
     private final HttpClient httpClient;
+    private final JavaMailSender javaMailSender;
     private final Map<String, ProductStock> lastSnapshot = new LinkedHashMap<>();
 
     @Value("${vmrack.stock-monitor.enabled:true}")
@@ -64,10 +70,21 @@ public class VmRackStockMonitorTask {
     @Value("${vmrack.stock-monitor.webhook-url:}")
     private String webhookUrl;
 
+    @Value("${vmrack.stock-monitor.email-enabled:true}")
+    private boolean emailEnabled;
+
+    @Value("${vmrack.stock-monitor.email-from:${spring.mail.username:}}")
+    private String emailFrom;
+
+    @Value("${vmrack.stock-monitor.email-to:342252328@qq.com}")
+    private String emailTo;
+
     private Instant lastAlertAt = Instant.EPOCH;
 
     public VmRackStockMonitorTask(
+            JavaMailSender javaMailSender,
             @Value("${vmrack.stock-monitor.connect-timeout-ms:5000}") long connectTimeoutMs) {
+        this.javaMailSender = javaMailSender;
         this.httpClient = HttpClient.newBuilder()
                 .connectTimeout(Duration.ofMillis(connectTimeoutMs))
                 .followRedirects(HttpClient.Redirect.NORMAL)
@@ -198,9 +215,56 @@ public class VmRackStockMonitorTask {
         String message = productLine + "，马上去抢购：" + pageUrl;
 
         log.warn("\u0007{} - {}", title, message);
+        sendEmail(title, message, availableProducts);
         sendWebhook(title, message, availableProducts);
         sendDesktopNotification(title, message);
         openBrowser();
+    }
+
+    private void sendEmail(String title, String message, List<ProductStock> availableProducts) {
+        if (!emailEnabled) {
+            return;
+        }
+        if (!StringUtils.hasText(emailFrom) || !StringUtils.hasText(emailTo)) {
+            log.warn("VMRack stock email skipped because email from/to is empty");
+            return;
+        }
+
+        SimpleMailMessage mailMessage = new SimpleMailMessage();
+        mailMessage.setFrom(emailFrom);
+        mailMessage.setTo(emailTo.split("\\s*,\\s*"));
+        mailMessage.setSubject(title);
+        mailMessage.setText(buildEmailText(message, availableProducts));
+
+        try {
+            javaMailSender.send(mailMessage);
+            log.info("VMRack stock email sent to {}", emailTo);
+        } catch (Exception ex) {
+            log.warn("VMRack stock email failed: {}", ex.getMessage(), ex);
+        }
+    }
+
+    private String buildEmailText(String message, List<ProductStock> availableProducts) {
+        StringBuilder content = new StringBuilder();
+        content.append("VMRack 监控发现以下套餐可能可以购买：").append(System.lineSeparator())
+                .append(System.lineSeparator());
+
+        for (ProductStock product : availableProducts) {
+            content.append("- ")
+                    .append(product.getName())
+                    .append("，价格：")
+                    .append(StringUtils.hasText(product.getPrice()) ? product.getPrice() : "未知")
+                    .append("，状态：")
+                    .append(product.statusText())
+                    .append(System.lineSeparator());
+        }
+
+        content.append(System.lineSeparator())
+                .append("页面地址：").append(pageUrl).append(System.lineSeparator())
+                .append("提醒时间：").append(LocalDateTime.now().format(DATE_TIME_FORMATTER)).append(System.lineSeparator())
+                .append(System.lineSeparator())
+                .append(message).append(System.lineSeparator());
+        return content.toString();
     }
 
     private void sendWebhook(String title, String message, List<ProductStock> availableProducts) {
