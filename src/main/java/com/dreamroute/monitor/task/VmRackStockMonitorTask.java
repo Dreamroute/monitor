@@ -60,7 +60,7 @@ public class VmRackStockMonitorTask {
     @Value("${vmrack.stock-monitor.request-timeout-ms:10000}")
     private long requestTimeoutMs;
 
-    @Value("${vmrack.stock-monitor.alert-cooldown-ms:30000}")
+    @Value("${vmrack.stock-monitor.alert-cooldown-ms:120000}")
     private long alertCooldownMs;
 
     @Value("${vmrack.stock-monitor.desktop-notification-enabled:true}")
