@@ -1,0 +1,1 @@
+./start.sh deploy --repo-url git@github.com:Dreamroute/monitor.git
