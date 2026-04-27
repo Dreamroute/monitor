@@ -118,7 +118,25 @@ public class VmRackStockMonitorTask {
     @Value("${vmrack.stock-monitor.test-alert-on-start:false}")
     private boolean testAlertOnStart;
 
+    @Value("${vmrack.stock-monitor.health-alert-enabled:true}")
+    private boolean healthAlertEnabled;
+
+    @Value("${vmrack.stock-monitor.health-empty-scan-threshold:5}")
+    private int healthEmptyScanThreshold;
+
+    @Value("${vmrack.stock-monitor.health-page-failure-threshold:3}")
+    private int healthPageFailureThreshold;
+
+    @Value("${vmrack.stock-monitor.health-broken-scan-threshold:3}")
+    private int healthBrokenScanThreshold;
+
+    @Value("${vmrack.stock-monitor.health-alert-cooldown-ms:21600000}")
+    private long healthAlertCooldownMs;
+
     private Instant lastAlertAt = Instant.EPOCH;
+    private Instant lastHealthAlertAt = Instant.EPOCH;
+    private int consecutiveEmptyScanCount;
+    private int consecutiveBrokenScanCount;
 
     public VmRackStockMonitorTask(
             JavaMailSender javaMailSender,
@@ -179,6 +197,7 @@ public class VmRackStockMonitorTask {
         Set<String> urlsToVisit = configuredSeedUrls();
         Set<String> visited = new LinkedHashSet<>();
         List<CheapServerOffer> offers = new ArrayList<>();
+        int failedPageCount = 0;
 
         while (!urlsToVisit.isEmpty() && visited.size() < maxPagesPerCheck) {
             String url = urlsToVisit.iterator().next();
@@ -194,11 +213,43 @@ public class VmRackStockMonitorTask {
                         .filter(link -> !visited.contains(link))
                         .forEach(urlsToVisit::add);
             } catch (Exception ex) {
+                failedPageCount++;
                 log.warn("VMRack page scan failed for {}: {}", url, ex.getMessage());
             }
         }
 
-        return dedupeOffers(offers);
+        List<CheapServerOffer> dedupedOffers = dedupeOffers(offers);
+        updateMonitorHealth(dedupedOffers, visited.size(), failedPageCount);
+        return dedupedOffers;
+    }
+
+    private void updateMonitorHealth(List<CheapServerOffer> offers, int visitedPageCount, int failedPageCount) {
+        if (!offers.isEmpty()) {
+            consecutiveEmptyScanCount = 0;
+        } else {
+            consecutiveEmptyScanCount++;
+        }
+
+        if (visitedPageCount == 0 || failedPageCount >= healthPageFailureThreshold) {
+            consecutiveBrokenScanCount++;
+        } else {
+            consecutiveBrokenScanCount = 0;
+        }
+
+        if (shouldHealthAlert()) {
+            lastHealthAlertAt = Instant.now();
+            sendHealthAlert(visitedPageCount, failedPageCount);
+        }
+    }
+
+    private boolean shouldHealthAlert() {
+        if (!healthAlertEnabled) {
+            return false;
+        }
+        boolean suspiciousEmpty = consecutiveEmptyScanCount >= healthEmptyScanThreshold;
+        boolean suspiciousFailures = consecutiveBrokenScanCount >= healthBrokenScanThreshold;
+        boolean cooldownPassed = Duration.between(lastHealthAlertAt, Instant.now()).toMillis() >= healthAlertCooldownMs;
+        return (suspiciousEmpty || suspiciousFailures) && cooldownPassed;
     }
 
     private RenderedPage renderPage(String url) throws IOException, InterruptedException {
@@ -494,11 +545,15 @@ public class VmRackStockMonitorTask {
     }
 
     private void sendEmail(String title, List<CheapServerOffer> offers) {
+        sendTextEmail(title, buildEmailText(offers), "cheap server");
+    }
+
+    private void sendTextEmail(String title, String text, String alertType) {
         if (!emailEnabled) {
             return;
         }
         if (!StringUtils.hasText(emailFrom) || !StringUtils.hasText(emailTo)) {
-            log.warn("VMRack cheap server email skipped because email from/to is empty");
+            log.warn("VMRack {} email skipped because email from/to is empty", alertType);
             return;
         }
 
@@ -506,14 +561,41 @@ public class VmRackStockMonitorTask {
         message.setFrom(emailFrom);
         message.setTo(emailTo.split("\\s*,\\s*"));
         message.setSubject(title);
-        message.setText(buildEmailText(offers));
+        message.setText(text);
 
         try {
             javaMailSender.send(message);
-            log.info("VMRack cheap server email sent to {}", emailTo);
+            log.info("VMRack {} email sent to {}", alertType, emailTo);
         } catch (Exception ex) {
-            log.warn("VMRack cheap server email failed: {}", ex.getMessage(), ex);
+            log.warn("VMRack {} email failed: {}", alertType, ex.getMessage(), ex);
         }
+    }
+
+    private void sendHealthAlert(int visitedPageCount, int failedPageCount) {
+        String title = "VMRack 监控可能失效";
+        String text = buildHealthAlertText(visitedPageCount, failedPageCount);
+
+        log.warn("\u0007{} - consecutiveEmptyScanCount={}, consecutiveBrokenScanCount={}, visitedPageCount={}, failedPageCount={}",
+                title, consecutiveEmptyScanCount, consecutiveBrokenScanCount, visitedPageCount, failedPageCount);
+        sendTextEmail(title, text, "monitor health");
+        sendDesktopNotification(title, "连续多轮没有解析到 VMRack 套餐，可能网站结构变了，需要检查监控代码。");
+    }
+
+    private String buildHealthAlertText(int visitedPageCount, int failedPageCount) {
+        return "VMRack 监控连续多轮出现异常，可能是网站结构大改、Cloudflare 拦截，或页面渲染/解析规则失效。"
+                + System.lineSeparator()
+                + System.lineSeparator()
+                + "连续空结果次数：" + consecutiveEmptyScanCount + System.lineSeparator()
+                + "连续抓取异常次数：" + consecutiveBrokenScanCount + System.lineSeparator()
+                + "本轮访问页面数：" + visitedPageCount + System.lineSeparator()
+                + "本轮失败页面数：" + failedPageCount + System.lineSeparator()
+                + "空结果告警阈值：" + healthEmptyScanThreshold + System.lineSeparator()
+                + "单轮页面失败阈值：" + healthPageFailureThreshold + System.lineSeparator()
+                + "连续失败告警阈值：" + healthBrokenScanThreshold + System.lineSeparator()
+                + "种子页面：" + seedUrls + System.lineSeparator()
+                + "提醒时间：" + LocalDateTime.now().format(DATE_TIME_FORMATTER) + System.lineSeparator()
+                + System.lineSeparator()
+                + "建议：登录服务器查看日志中的 'VMRack page scan failed'，然后让 Codex 根据最新页面改解析逻辑。";
     }
 
     private String buildEmailText(List<CheapServerOffer> offers) {
