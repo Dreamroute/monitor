@@ -108,7 +108,7 @@ public class VmRackStockMonitorTask {
     }
 
     @Scheduled(
-            fixedDelayString = "${vmrack.stock-monitor.fixed-delay-ms:5000}",
+            fixedDelayString = "${vmrack.stock-monitor.fixed-delay-ms:3000}",
             initialDelayString = "${vmrack.stock-monitor.initial-delay-ms:1000}")
     public void checkStock() {
         if (!enabled) {
