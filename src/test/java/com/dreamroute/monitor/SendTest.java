@@ -1,6 +1,7 @@
 package com.dreamroute.monitor;
 
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.condition.EnabledIfSystemProperty;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.mail.SimpleMailMessage;
 import org.springframework.mail.javamail.JavaMailSender;
@@ -8,8 +9,9 @@ import org.springframework.test.context.ActiveProfiles;
 
 import javax.annotation.Resource;
 
-@SpringBootTest
+@SpringBootTest(properties = "vmrack.stock-monitor.enabled=false")
 @ActiveProfiles("local")
+@EnabledIfSystemProperty(named = "send.mail.test", matches = "true")
 class SendTest {
 
     @Resource
