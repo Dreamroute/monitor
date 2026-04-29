@@ -136,8 +136,11 @@ public class VmRackStockMonitorTask {
     @Value("${dedirock.stock-monitor.enabled:true}")
     private boolean dediRockEnabled;
 
-    @Value("${dedirock.stock-monitor.url:https://dedirock.cn/a/216}")
+    @Value("${dedirock.stock-monitor.url:https://billing.dedirock.com/index.php/store/promo-cm-leb-2025/promo-vps-saver-la-cm-leb-2025}")
     private String dediRockUrl;
+
+    @Value("${dedirock.stock-monitor.request-timeout-ms:45000}")
+    private long dediRockRequestTimeoutMs;
 
     @Value("${dedirock.stock-monitor.out-of-stock-keywords:Out of Stock,out of stock,缺货,售罄,暂停下单,orders for it have been suspended}")
     private String dediRockOutOfStockKeywords;
@@ -217,7 +220,7 @@ public class VmRackStockMonitorTask {
         }
 
         try {
-            RenderedPage page = fetchStaticPage(dediRockUrl);
+            RenderedPage page = fetchStaticPage(dediRockUrl, dediRockRequestTimeoutMs);
             DediRockStockStatus status = parseDediRockStockStatus(
                     page.document.html(),
                     page.url,
@@ -316,9 +319,13 @@ public class VmRackStockMonitorTask {
     }
 
     private RenderedPage fetchStaticPage(String url) throws IOException, InterruptedException {
+        return fetchStaticPage(url, requestTimeoutMs);
+    }
+
+    private RenderedPage fetchStaticPage(String url, long timeoutMs) throws IOException, InterruptedException {
         HttpRequest request = HttpRequest.newBuilder(URI.create(url))
                 .version(HttpClient.Version.HTTP_1_1)
-                .timeout(Duration.ofMillis(requestTimeoutMs))
+                .timeout(Duration.ofMillis(timeoutMs))
                 .header("User-Agent", USER_AGENT)
                 .header("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
                 .header("Accept-Language", "zh-CN,zh;q=0.9,en;q=0.8")
