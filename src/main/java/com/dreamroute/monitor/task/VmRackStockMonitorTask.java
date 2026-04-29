@@ -133,10 +133,27 @@ public class VmRackStockMonitorTask {
     @Value("${vmrack.stock-monitor.health-alert-cooldown-ms:21600000}")
     private long healthAlertCooldownMs;
 
+    @Value("${dedirock.stock-monitor.enabled:true}")
+    private boolean dediRockEnabled;
+
+    @Value("${dedirock.stock-monitor.url:https://dedirock.cn/a/216}")
+    private String dediRockUrl;
+
+    @Value("${dedirock.stock-monitor.out-of-stock-keywords:Out of Stock,out of stock,缺货,售罄,暂停下单,orders for it have been suspended}")
+    private String dediRockOutOfStockKeywords;
+
+    @Value("${dedirock.stock-monitor.valid-page-keywords:Shopping Cart,DediRock,Configure,Checkout,Order Summary}")
+    private String dediRockValidPageKeywords;
+
+    @Value("${dedirock.stock-monitor.alert-cooldown-ms:1800000}")
+    private long dediRockAlertCooldownMs;
+
     private Instant lastAlertAt = Instant.EPOCH;
     private Instant lastHealthAlertAt = Instant.EPOCH;
+    private Instant lastDediRockAlertAt = Instant.EPOCH;
     private int consecutiveEmptyScanCount;
     private int consecutiveBrokenScanCount;
+    private Boolean lastDediRockAvailable;
 
     public VmRackStockMonitorTask(
             JavaMailSender javaMailSender,
@@ -188,8 +205,33 @@ public class VmRackStockMonitorTask {
             }
 
             remember(offers);
+            checkDediRockStock();
         } catch (Exception ex) {
             log.warn("VMRack cheap server monitor failed: {}", ex.getMessage(), ex);
+        }
+    }
+
+    private void checkDediRockStock() {
+        if (!dediRockEnabled) {
+            return;
+        }
+
+        try {
+            RenderedPage page = fetchStaticPage(dediRockUrl);
+            DediRockStockStatus status = parseDediRockStockStatus(
+                    page.document.html(),
+                    page.url,
+                    dediRockOutOfStockKeywords,
+                    dediRockValidPageKeywords);
+            logDediRockState(status);
+
+            if (status.available && shouldAlertDediRock(status)) {
+                lastDediRockAlertAt = Instant.now();
+                sendDediRockAlert(status);
+            }
+            lastDediRockAvailable = status.available;
+        } catch (Exception ex) {
+            log.warn("DediRock stock monitor failed for {}: {}", dediRockUrl, ex.getMessage(), ex);
         }
     }
 
@@ -287,7 +329,30 @@ public class VmRackStockMonitorTask {
         if (response.statusCode() >= 400) {
             throw new IOException("HTTP " + response.statusCode());
         }
-        return new RenderedPage(url, Jsoup.parse(response.body(), url));
+        return new RenderedPage(response.uri().toString(), Jsoup.parse(response.body(), response.uri().toString()));
+    }
+
+    static DediRockStockStatus parseDediRockStockStatus(
+            String html,
+            String url,
+            String outOfStockKeywords,
+            String validPageKeywords) {
+        Document document = Jsoup.parse(html, url);
+        String text = normalize(document.text());
+        boolean validPage = containsAnyToken(text, csvToList(validPageKeywords));
+        boolean outOfStock = containsAnyToken(text, csvToList(outOfStockKeywords));
+        boolean available = validPage && !outOfStock;
+        String status = !validPage ? "页面待确认" : (available ? "可能可购买" : "缺货");
+        String title = StringUtils.hasText(document.title()) ? document.title() : "DediRock 216";
+
+        return new DediRockStockStatus(
+                title,
+                status,
+                url,
+                shorten(text, 360),
+                validPage,
+                outOfStock,
+                available);
     }
 
     private List<CheapServerOffer> extractOffers(RenderedPage page) {
@@ -525,6 +590,25 @@ public class VmRackStockMonitorTask {
         return hasNewQualifiedOffer || cooldownPassed;
     }
 
+    private void logDediRockState(DediRockStockStatus status) {
+        if (!status.validPage) {
+            log.warn("DediRock monitor: page needs review [{}] {}", status.sourceUrl, status.context);
+            return;
+        }
+        if (lastDediRockAvailable == null || lastDediRockAvailable != status.available) {
+            log.info("DediRock monitor: {} [{}]", status.status, status.sourceUrl);
+            return;
+        }
+        log.debug("DediRock monitor: {} [{}]", status.status, status.sourceUrl);
+    }
+
+    private boolean shouldAlertDediRock(DediRockStockStatus status) {
+        boolean newlyAvailable = lastDediRockAvailable == null || !lastDediRockAvailable;
+        boolean cooldownPassed = Duration.between(lastDediRockAlertAt, Instant.now()).toMillis()
+                >= dediRockAlertCooldownMs;
+        return status.validPage && status.available && (newlyAvailable || cooldownPassed);
+    }
+
     private void remember(List<CheapServerOffer> offers) {
         lastSnapshot.clear();
         for (CheapServerOffer offer : offers) {
@@ -542,6 +626,16 @@ public class VmRackStockMonitorTask {
         sendWebhook(title, message, offers);
         sendDesktopNotification(title, message);
         openBrowser(offers);
+    }
+
+    private void sendDediRockAlert(DediRockStockStatus status) {
+        String title = "DediRock 216 可能有货";
+        String message = status.status + " " + status.sourceUrl;
+
+        log.warn("\u0007{} - {}", title, message);
+        sendTextEmail(title, buildDediRockEmailText(status), "dedirock stock");
+        sendDesktopNotification(title, message);
+        openUrl(status.sourceUrl);
     }
 
     private void sendEmail(String title, List<CheapServerOffer> offers) {
@@ -596,6 +690,17 @@ public class VmRackStockMonitorTask {
                 + "提醒时间：" + LocalDateTime.now().format(DATE_TIME_FORMATTER) + System.lineSeparator()
                 + System.lineSeparator()
                 + "建议：登录服务器查看日志中的 'VMRack page scan failed'，然后让 Codex 根据最新页面改解析逻辑。";
+    }
+
+    private String buildDediRockEmailText(DediRockStockStatus status) {
+        return "DediRock 216 页面当前不是缺货状态，可能可以下单："
+                + System.lineSeparator()
+                + System.lineSeparator()
+                + "状态：" + status.status + System.lineSeparator()
+                + "页面：" + status.sourceUrl + System.lineSeparator()
+                + "标题：" + status.title + System.lineSeparator()
+                + "片段：" + status.context + System.lineSeparator()
+                + "提醒时间：" + LocalDateTime.now().format(DATE_TIME_FORMATTER) + System.lineSeparator();
     }
 
     private String buildEmailText(List<CheapServerOffer> offers) {
@@ -688,6 +793,17 @@ public class VmRackStockMonitorTask {
             } catch (IOException ex) {
                 log.warn("VMRack cheap server browser open failed for {}: {}", url, ex.getMessage());
             }
+        }
+    }
+
+    private void openUrl(String url) {
+        if (!openBrowserOnStock || !isMac() || !StringUtils.hasText(url)) {
+            return;
+        }
+        try {
+            new ProcessBuilder("open", url).start();
+        } catch (IOException ex) {
+            log.warn("Browser open failed for {}: {}", url, ex.getMessage());
         }
     }
 
@@ -864,6 +980,39 @@ public class VmRackStockMonitorTask {
 
         String uniqueKey() {
             return sourceUrl + "::" + name;
+        }
+    }
+
+    static class DediRockStockStatus {
+        private final String title;
+        private final String status;
+        private final String sourceUrl;
+        private final String context;
+        private final boolean validPage;
+        private final boolean outOfStock;
+        private final boolean available;
+
+        DediRockStockStatus(String title, String status, String sourceUrl, String context,
+                            boolean validPage, boolean outOfStock, boolean available) {
+            this.title = title;
+            this.status = status;
+            this.sourceUrl = sourceUrl;
+            this.context = context;
+            this.validPage = validPage;
+            this.outOfStock = outOfStock;
+            this.available = available;
+        }
+
+        boolean isValidPage() {
+            return validPage;
+        }
+
+        boolean isOutOfStock() {
+            return outOfStock;
+        }
+
+        boolean isAvailable() {
+            return available;
         }
     }
 

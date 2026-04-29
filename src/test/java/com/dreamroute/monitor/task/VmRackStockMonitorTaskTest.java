@@ -14,6 +14,10 @@ class VmRackStockMonitorTaskTest {
     private static final String EXCLUDE_KEYWORDS = "三网优化,美国原生,Global BGP,Platinum,163/10099/CMI,Cogent/Arelion";
     private static final String SOLD_OUT_KEYWORDS = "已售罄,售罄,Sold Out,Sold out,活动结束,已结束,结束";
     private static final String BUYABLE_KEYWORDS = "库存紧张,低库存,购买,购买并部署,立即使用,Buy,Deploy,Low Stock";
+    private static final String DEDIROCK_OUT_OF_STOCK_KEYWORDS =
+            "Out of Stock,out of stock,缺货,售罄,暂停下单,orders for it have been suspended";
+    private static final String DEDIROCK_VALID_PAGE_KEYWORDS =
+            "Shopping Cart,DediRock,Configure,Checkout,Order Summary";
 
     @Test
     void parseCheapServerOffersFindsBuyablePremiumDeployRow() {
@@ -81,5 +85,41 @@ class VmRackStockMonitorTaskTest {
         assertEquals(VmRackStockMonitorTask.PricePeriod.YEAR, VmRackStockMonitorTask.PricePeriod.from("年"));
         assertEquals(VmRackStockMonitorTask.PricePeriod.YEAR, VmRackStockMonitorTask.PricePeriod.from("year"));
         assertEquals(VmRackStockMonitorTask.PricePeriod.MONTH, VmRackStockMonitorTask.PricePeriod.from("月"));
+    }
+
+    @Test
+    void parseDediRockStockStatusTreatsOutOfStockAsUnavailable() {
+        String html = "<html><head><title>Shopping Cart - DediRock</title></head><body>"
+                + "<div class='alert alert-danger'>Out of Stock</div>"
+                + "<p>orders for it have been suspended until more stock is available.</p>"
+                + "</body></html>";
+
+        VmRackStockMonitorTask.DediRockStockStatus status = VmRackStockMonitorTask.parseDediRockStockStatus(
+                html,
+                "https://dedirock.cn/a/216",
+                DEDIROCK_OUT_OF_STOCK_KEYWORDS,
+                DEDIROCK_VALID_PAGE_KEYWORDS);
+
+        assertTrue(status.isValidPage());
+        assertTrue(status.isOutOfStock());
+        assertFalse(status.isAvailable());
+    }
+
+    @Test
+    void parseDediRockStockStatusTreatsValidNonOutOfStockPageAsAvailable() {
+        String html = "<html><head><title>Shopping Cart - DediRock</title></head><body>"
+                + "<h1>Configure</h1>"
+                + "<button>Checkout</button>"
+                + "</body></html>";
+
+        VmRackStockMonitorTask.DediRockStockStatus status = VmRackStockMonitorTask.parseDediRockStockStatus(
+                html,
+                "https://dedirock.cn/a/216",
+                DEDIROCK_OUT_OF_STOCK_KEYWORDS,
+                DEDIROCK_VALID_PAGE_KEYWORDS);
+
+        assertTrue(status.isValidPage());
+        assertFalse(status.isOutOfStock());
+        assertTrue(status.isAvailable());
     }
 }
