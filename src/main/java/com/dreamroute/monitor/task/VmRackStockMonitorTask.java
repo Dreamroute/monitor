@@ -6,6 +6,7 @@ import org.htmlunit.html.HtmlPage;
 import org.jsoup.Jsoup;
 import org.jsoup.nodes.Document;
 import org.jsoup.nodes.Element;
+import org.jsoup.parser.Parser;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Value;
@@ -53,10 +54,12 @@ public class VmRackStockMonitorTask {
             Pattern.CASE_INSENSITIVE);
     private static final Pattern LEVEL_SERVER_NAME_PATTERN = Pattern.compile("L\\d+\\.VPS[.A-Za-z0-9_-]*");
     private static final Pattern GENERIC_SERVER_NAME_PATTERN = Pattern.compile("VPS[.A-Za-z0-9_-]*");
+    private static final Pattern CPU_MEMORY_PLAN_PATTERN = Pattern.compile("\\b\\d+C\\d+G\\b", Pattern.CASE_INSENSITIVE);
 
     private final HttpClient httpClient;
     private final JavaMailSender javaMailSender;
     private final Map<String, CheapServerOffer> lastSnapshot = new LinkedHashMap<>();
+    private final Map<String, ActivityCandidate> lastActivitySnapshot = new LinkedHashMap<>();
 
     @Value("${vmrack.stock-monitor.enabled:true}")
     private boolean enabled;
@@ -133,30 +136,29 @@ public class VmRackStockMonitorTask {
     @Value("${vmrack.stock-monitor.health-alert-cooldown-ms:21600000}")
     private long healthAlertCooldownMs;
 
-    @Value("${dedirock.stock-monitor.enabled:true}")
-    private boolean dediRockEnabled;
+    @Value("${vmrack.stock-monitor.activity-alert-enabled:true}")
+    private boolean activityAlertEnabled;
 
-    @Value("${dedirock.stock-monitor.url:https://billing.dedirock.com/index.php/store/promo-cm-leb-2025/promo-vps-saver-la-cm-leb-2025}")
-    private String dediRockUrl;
+    @Value("${vmrack.stock-monitor.sitemap-urls:https://www.vmrack.net/sitemap.xml,https://www.vmrack.net/sitemap_index.xml}")
+    private String sitemapUrls;
 
-    @Value("${dedirock.stock-monitor.request-timeout-ms:45000}")
-    private long dediRockRequestTimeoutMs;
+    @Value("${vmrack.stock-monitor.activity-path-keywords:/activity/,/promo,/campaign,/deals,/sale}")
+    private String activityPathKeywords;
 
-    @Value("${dedirock.stock-monitor.out-of-stock-keywords:Out of Stock,out of stock,缺货,售罄,暂停下单,orders for it have been suspended}")
-    private String dediRockOutOfStockKeywords;
+    @Value("${vmrack.stock-monitor.activity-keywords:活动,优惠,促销,特惠,限时,限量,闪购,补货,春季,夏季,秋季,冬季,新年,黑五,双十一,Promo,Campaign,Sale,Special,Deal}")
+    private String activityKeywords;
 
-    @Value("${dedirock.stock-monitor.valid-page-keywords:Shopping Cart,DediRock,Configure,Checkout,Order Summary}")
-    private String dediRockValidPageKeywords;
+    @Value("${vmrack.stock-monitor.activity-ended-keywords:活动结束,已结束,结束,售罄,已售罄,Sold Out,Sold out,Expired,Ended}")
+    private String activityEndedKeywords;
 
-    @Value("${dedirock.stock-monitor.alert-cooldown-ms:1800000}")
-    private long dediRockAlertCooldownMs;
+    @Value("${vmrack.stock-monitor.activity-alert-cooldown-ms:21600000}")
+    private long activityAlertCooldownMs;
 
     private Instant lastAlertAt = Instant.EPOCH;
     private Instant lastHealthAlertAt = Instant.EPOCH;
-    private Instant lastDediRockAlertAt = Instant.EPOCH;
+    private Instant lastActivityAlertAt = Instant.EPOCH;
     private int consecutiveEmptyScanCount;
     private int consecutiveBrokenScanCount;
-    private Boolean lastDediRockAvailable;
 
     public VmRackStockMonitorTask(
             JavaMailSender javaMailSender,
@@ -196,8 +198,19 @@ public class VmRackStockMonitorTask {
         }
 
         try {
-            List<CheapServerOffer> offers = scanSite();
+            ScanResult result = scanSite();
+            List<CheapServerOffer> offers = result.offers;
             logStateChanges(offers);
+            logActivityStateChanges(result.activities);
+
+            List<ActivityCandidate> newActivities = result.activities.stream()
+                    .filter(ActivityCandidate::isActive)
+                    .filter(this::shouldAlertActivity)
+                    .collect(Collectors.toList());
+            if (!newActivities.isEmpty()) {
+                lastActivityAlertAt = Instant.now();
+                sendActivityAlert(newActivities);
+            }
 
             List<CheapServerOffer> qualifiedOffers = offers.stream()
                     .filter(CheapServerOffer::isQualified)
@@ -208,41 +221,21 @@ public class VmRackStockMonitorTask {
             }
 
             remember(offers);
-//            checkDediRockStock();
+            rememberActivities(result.activities);
         } catch (Exception ex) {
             log.warn("VMRack cheap server monitor failed: {}", ex.getMessage(), ex);
         }
     }
 
-    private void checkDediRockStock() {
-        if (!dediRockEnabled) {
-            return;
-        }
-
-        try {
-            RenderedPage page = fetchStaticPage(dediRockUrl, dediRockRequestTimeoutMs);
-            DediRockStockStatus status = parseDediRockStockStatus(
-                    page.document.html(),
-                    page.url,
-                    dediRockOutOfStockKeywords,
-                    dediRockValidPageKeywords);
-            logDediRockState(status);
-
-            if (status.available && shouldAlertDediRock(status)) {
-                lastDediRockAlertAt = Instant.now();
-                sendDediRockAlert(status);
-            }
-            lastDediRockAvailable = status.available;
-        } catch (Exception ex) {
-            log.warn("DediRock stock monitor failed for {}: {}", dediRockUrl, ex.getMessage(), ex);
-        }
-    }
-
-    List<CheapServerOffer> scanSite() {
+    ScanResult scanSite() {
         Set<String> urlsToVisit = configuredSeedUrls();
+        urlsToVisit.addAll(discoverSitemapUrls());
         Set<String> visited = new LinkedHashSet<>();
         List<CheapServerOffer> offers = new ArrayList<>();
+        List<ActivityCandidate> activities = new ArrayList<>();
         int failedPageCount = 0;
+        int healthyPageCount = 0;
+        int offerSignalPageCount = 0;
 
         while (!urlsToVisit.isEmpty() && visited.size() < maxPagesPerCheck) {
             String url = urlsToVisit.iterator().next();
@@ -253,7 +246,17 @@ public class VmRackStockMonitorTask {
 
             try {
                 RenderedPage page = renderPage(url);
+                if (pageLooksHealthy(page)) {
+                    healthyPageCount++;
+                }
+                if (pageHasOfferSignals(page)) {
+                    offerSignalPageCount++;
+                }
                 offers.addAll(extractOffers(page));
+                ActivityCandidate activity = extractActivityCandidate(page);
+                if (activity != null) {
+                    activities.add(activity);
+                }
                 collectInterestingLinks(page.document).stream()
                         .filter(link -> !visited.contains(link))
                         .forEach(urlsToVisit::add);
@@ -264,18 +267,19 @@ public class VmRackStockMonitorTask {
         }
 
         List<CheapServerOffer> dedupedOffers = dedupeOffers(offers);
-        updateMonitorHealth(dedupedOffers, visited.size(), failedPageCount);
-        return dedupedOffers;
+        updateMonitorHealth(dedupedOffers, visited.size(), failedPageCount, healthyPageCount, offerSignalPageCount);
+        return new ScanResult(dedupedOffers, dedupeActivities(activities));
     }
 
-    private void updateMonitorHealth(List<CheapServerOffer> offers, int visitedPageCount, int failedPageCount) {
-        if (!offers.isEmpty()) {
+    private void updateMonitorHealth(List<CheapServerOffer> offers, int visitedPageCount, int failedPageCount,
+                                     int healthyPageCount, int offerSignalPageCount) {
+        if (!offers.isEmpty() || offerSignalPageCount == 0) {
             consecutiveEmptyScanCount = 0;
         } else {
             consecutiveEmptyScanCount++;
         }
 
-        if (visitedPageCount == 0 || failedPageCount >= healthPageFailureThreshold) {
+        if (visitedPageCount == 0 || healthyPageCount == 0 || failedPageCount >= healthPageFailureThreshold) {
             consecutiveBrokenScanCount++;
         } else {
             consecutiveBrokenScanCount = 0;
@@ -283,7 +287,7 @@ public class VmRackStockMonitorTask {
 
         if (shouldHealthAlert()) {
             lastHealthAlertAt = Instant.now();
-            sendHealthAlert(visitedPageCount, failedPageCount);
+            sendHealthAlert(visitedPageCount, failedPageCount, healthyPageCount, offerSignalPageCount);
         }
     }
 
@@ -339,27 +343,59 @@ public class VmRackStockMonitorTask {
         return new RenderedPage(response.uri().toString(), Jsoup.parse(response.body(), response.uri().toString()));
     }
 
-    static DediRockStockStatus parseDediRockStockStatus(
-            String html,
-            String url,
-            String outOfStockKeywords,
-            String validPageKeywords) {
-        Document document = Jsoup.parse(html, url);
-        String text = normalize(document.text());
-        boolean validPage = containsAnyToken(text, csvToList(validPageKeywords));
-        boolean outOfStock = containsAnyToken(text, csvToList(outOfStockKeywords));
-        boolean available = validPage && !outOfStock;
-        String status = !validPage ? "页面待确认" : (available ? "可能可购买" : "缺货");
-        String title = StringUtils.hasText(document.title()) ? document.title() : "DediRock 216";
+    private Set<String> discoverSitemapUrls() {
+        Set<String> urls = new LinkedHashSet<>();
+        for (String sitemapUrl : csvToList(sitemapUrls)) {
+            try {
+                collectSitemapPageUrls(sitemapUrl, urls, 0);
+            } catch (Exception ex) {
+                log.debug("VMRack sitemap scan failed for {}: {}", sitemapUrl, ex.getMessage());
+            }
+        }
+        return urls;
+    }
 
-        return new DediRockStockStatus(
-                title,
-                status,
-                url,
-                shorten(text, 360),
-                validPage,
-                outOfStock,
-                available);
+    private void collectSitemapPageUrls(String sitemapUrl, Set<String> urls, int depth)
+            throws IOException, InterruptedException {
+        if (depth > 1) {
+            return;
+        }
+        for (String url : fetchSitemapUrls(sitemapUrl)) {
+            String normalizedUrl = normalizeSameSiteUrl(url);
+            if (StringUtils.hasText(normalizedUrl) && isInterestingPath(URI.create(normalizedUrl).getPath())) {
+                urls.add(normalizedUrl);
+                continue;
+            }
+            if (isSameSiteSitemapUrl(url)) {
+                collectSitemapPageUrls(url, urls, depth + 1);
+            }
+        }
+    }
+
+    private Set<String> fetchSitemapUrls(String sitemapUrl) throws IOException, InterruptedException {
+        HttpRequest request = HttpRequest.newBuilder(URI.create(sitemapUrl))
+                .version(HttpClient.Version.HTTP_1_1)
+                .timeout(Duration.ofMillis(requestTimeoutMs))
+                .header("User-Agent", USER_AGENT)
+                .header("Accept", "application/xml,text/xml,text/plain,*/*;q=0.8")
+                .header("Accept-Language", "zh-CN,zh;q=0.9,en;q=0.8")
+                .GET()
+                .build();
+        HttpResponse<String> response = httpClient.send(
+                request, HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
+        if (response.statusCode() >= 400) {
+            throw new IOException("HTTP " + response.statusCode());
+        }
+
+        Set<String> urls = new LinkedHashSet<>();
+        Document document = Jsoup.parse(response.body(), response.uri().toString(), Parser.xmlParser());
+        for (Element loc : document.select("loc")) {
+            String url = normalize(loc.text());
+            if (StringUtils.hasText(url)) {
+                urls.add(url);
+            }
+        }
+        return urls;
     }
 
     private List<CheapServerOffer> extractOffers(RenderedPage page) {
@@ -401,7 +437,8 @@ public class VmRackStockMonitorTask {
             double maxMonthlyUsd,
             double maxYearlyUsd) {
         List<CheapServerOffer> offers = new ArrayList<>();
-        boolean pagePremium = containsAnyToken(page.document.text(), premiumKeywords);
+        String searchableText = searchableText(page.document);
+        boolean pagePremium = containsAnyToken(searchableText, premiumKeywords);
 
         offers.addAll(extractTableOffers(
                 page, pagePremium, premiumKeywords, excludeKeywords, soldOutKeywords,
@@ -410,7 +447,7 @@ public class VmRackStockMonitorTask {
                 page, pagePremium, premiumKeywords, excludeKeywords, soldOutKeywords,
                 buyableKeywords, maxMonthlyUsd, maxYearlyUsd));
         offers.addAll(extractTextWindowOffers(
-                page, pagePremium, premiumKeywords, excludeKeywords, soldOutKeywords,
+                page, searchableText, pagePremium, premiumKeywords, excludeKeywords, soldOutKeywords,
                 buyableKeywords, maxMonthlyUsd, maxYearlyUsd));
 
         List<CheapServerOffer> parsedOffers = offers.stream()
@@ -469,6 +506,7 @@ public class VmRackStockMonitorTask {
 
     private static List<CheapServerOffer> extractTextWindowOffers(
             RenderedPage page,
+            String searchableText,
             boolean pagePremium,
             List<String> premiumKeywords,
             List<String> excludeKeywords,
@@ -476,8 +514,8 @@ public class VmRackStockMonitorTask {
             List<String> buyableKeywords,
             double maxMonthlyUsd,
             double maxYearlyUsd) {
-        String text = normalize(page.document.text());
-        if (!pagePremium || !hasPrice(text)) {
+        String text = normalize(searchableText);
+        if (!pagePremium || !hasPositivePrice(text)) {
             return Collections.emptyList();
         }
 
@@ -487,7 +525,7 @@ public class VmRackStockMonitorTask {
             int start = Math.max(0, matcher.start() - 220);
             int end = Math.min(text.length(), matcher.end() + 220);
             String context = text.substring(start, end);
-            if (looksLikeServerOffer(context) && isPremium(context, premiumKeywords)) {
+            if (looksLikeConcreteServerOffer(context) && isPremium(context, premiumKeywords)) {
                 offers.add(buildOffer(
                         page.url, context, true, excludeKeywords, soldOutKeywords,
                         buyableKeywords, maxMonthlyUsd, maxYearlyUsd));
@@ -505,7 +543,7 @@ public class VmRackStockMonitorTask {
             List<String> buyableKeywords,
             double maxMonthlyUsd,
             double maxYearlyUsd) {
-        Price price = firstPrice(context);
+        Price price = firstPositivePrice(context);
         if (price == null) {
             return null;
         }
@@ -529,29 +567,36 @@ public class VmRackStockMonitorTask {
                 qualified);
     }
 
+    private ActivityCandidate extractActivityCandidate(RenderedPage page) {
+        String text = searchableText(page.document);
+        boolean activityPath = isActivityPath(page.url);
+        boolean activityText = containsAnyToken(text, csvToList(activityKeywords));
+        boolean active = ((activityPath && pageLooksHealthy(page)
+                && (activityText || hasPositivePrice(text) || pageHasOfferSignals(page)))
+                || (activityText && pageHasOfferSignals(page)))
+                && !containsAnyToken(text, csvToList(activityEndedKeywords));
+        if (!activityPath && !active) {
+            return null;
+        }
+
+        return new ActivityCandidate(
+                pageTitle(page.document),
+                page.url,
+                active ? "疑似新活动/优惠进行中" : "活动页待确认",
+                shorten(text, 360),
+                active);
+    }
+
     private Set<String> collectInterestingLinks(Document document) {
         Set<String> links = new LinkedHashSet<>();
-        URI base = URI.create(baseUrl);
         for (Element link : document.select("a[href]")) {
             String absUrl = link.absUrl("href");
-            if (!StringUtils.hasText(absUrl)) {
+            String normalizedUrl = normalizeSameSiteUrl(absUrl);
+            if (!StringUtils.hasText(normalizedUrl)) {
                 continue;
             }
-            URI uri;
-            try {
-                uri = URI.create(absUrl.split("#")[0]);
-            } catch (IllegalArgumentException ex) {
-                continue;
-            }
-            if (!base.getHost().equalsIgnoreCase(uri.getHost())) {
-                continue;
-            }
-            String path = uri.getPath();
-            if (path == null || !path.startsWith("/zh-CN")) {
-                continue;
-            }
-            if (isInterestingPath(path)) {
-                links.add(uri.toString());
+            if (isInterestingPath(URI.create(normalizedUrl).getPath())) {
+                links.add(normalizedUrl);
             }
         }
         return links;
@@ -562,6 +607,7 @@ public class VmRackStockMonitorTask {
         return value.contains("vps")
                 || value.contains("pricing")
                 || value.contains("activity")
+                || isActivityPath(path)
                 || value.contains("deploy-new-instance");
     }
 
@@ -587,6 +633,19 @@ public class VmRackStockMonitorTask {
                 offer.name, offer.priceText, offer.status, offer.sourceUrl);
     }
 
+    private void logActivityStateChanges(List<ActivityCandidate> activities) {
+        for (ActivityCandidate activity : activities) {
+            ActivityCandidate old = lastActivitySnapshot.get(activity.uniqueKey());
+            if (old == null) {
+                log.info("VMRack activity monitor: {} {} [{}]",
+                        activity.title, activity.status, activity.sourceUrl);
+            } else if (old.active != activity.active || !old.status.equals(activity.status)) {
+                log.info("VMRack activity monitor: {} changed from {} to {} [{}]",
+                        activity.title, old.status, activity.status, activity.sourceUrl);
+            }
+        }
+    }
+
     private boolean shouldAlert(List<CheapServerOffer> offers) {
         boolean hasNewQualifiedOffer = offers.stream()
                 .anyMatch(offer -> {
@@ -597,29 +656,28 @@ public class VmRackStockMonitorTask {
         return hasNewQualifiedOffer || cooldownPassed;
     }
 
-    private void logDediRockState(DediRockStockStatus status) {
-        if (!status.validPage) {
-            log.warn("DediRock monitor: page needs review [{}] {}", status.sourceUrl, status.context);
-            return;
+    private boolean shouldAlertActivity(ActivityCandidate activity) {
+        if (!activityAlertEnabled) {
+            return false;
         }
-        if (lastDediRockAvailable == null || lastDediRockAvailable != status.available) {
-            log.info("DediRock monitor: {} [{}]", status.status, status.sourceUrl);
-            return;
-        }
-        log.debug("DediRock monitor: {} [{}]", status.status, status.sourceUrl);
-    }
-
-    private boolean shouldAlertDediRock(DediRockStockStatus status) {
-        boolean newlyAvailable = lastDediRockAvailable == null || !lastDediRockAvailable;
-        boolean cooldownPassed = Duration.between(lastDediRockAlertAt, Instant.now()).toMillis()
-                >= dediRockAlertCooldownMs;
-        return status.validPage && status.available && (newlyAvailable || cooldownPassed);
+        ActivityCandidate old = lastActivitySnapshot.get(activity.uniqueKey());
+        boolean newlyActive = old == null || !old.active;
+        boolean cooldownPassed = Duration.between(lastActivityAlertAt, Instant.now()).toMillis()
+                >= activityAlertCooldownMs;
+        return newlyActive || cooldownPassed;
     }
 
     private void remember(List<CheapServerOffer> offers) {
         lastSnapshot.clear();
         for (CheapServerOffer offer : offers) {
             lastSnapshot.put(offer.uniqueKey(), offer);
+        }
+    }
+
+    private void rememberActivities(List<ActivityCandidate> activities) {
+        lastActivitySnapshot.clear();
+        for (ActivityCandidate activity : activities) {
+            lastActivitySnapshot.put(activity.uniqueKey(), activity);
         }
     }
 
@@ -635,18 +693,20 @@ public class VmRackStockMonitorTask {
         openBrowser(offers);
     }
 
-    private void sendDediRockAlert(DediRockStockStatus status) {
-        String title = "DediRock 216 可能有货";
-        String message = status.status + " " + status.sourceUrl;
-
-        log.warn("\u0007{} - {}", title, message);
-        sendTextEmail(title, buildDediRockEmailText(status), "dedirock stock");
-        sendDesktopNotification(title, message);
-        openUrl(status.sourceUrl);
-    }
-
     private void sendEmail(String title, List<CheapServerOffer> offers) {
         sendTextEmail(title, buildEmailText(offers), "cheap server");
+    }
+
+    private void sendActivityAlert(List<ActivityCandidate> activities) {
+        String title = "VMRack 发现新活动页面";
+        String message = activities.stream()
+                .map(activity -> activity.title + " " + activity.status + " " + activity.sourceUrl)
+                .collect(Collectors.joining("; "));
+
+        log.warn("\u0007{} - {}", title, message);
+        sendTextEmail(title, buildActivityEmailText(activities), "activity");
+        sendDesktopNotification(title, message);
+        openActivityPages(activities);
     }
 
     private void sendTextEmail(String title, String text, String alertType) {
@@ -672,17 +732,21 @@ public class VmRackStockMonitorTask {
         }
     }
 
-    private void sendHealthAlert(int visitedPageCount, int failedPageCount) {
+    private void sendHealthAlert(int visitedPageCount, int failedPageCount,
+                                 int healthyPageCount, int offerSignalPageCount) {
         String title = "VMRack 监控可能失效";
-        String text = buildHealthAlertText(visitedPageCount, failedPageCount);
+        String text = buildHealthAlertText(visitedPageCount, failedPageCount, healthyPageCount, offerSignalPageCount);
 
-        log.warn("\u0007{} - consecutiveEmptyScanCount={}, consecutiveBrokenScanCount={}, visitedPageCount={}, failedPageCount={}",
-                title, consecutiveEmptyScanCount, consecutiveBrokenScanCount, visitedPageCount, failedPageCount);
+        log.warn("\u0007{} - consecutiveEmptyScanCount={}, consecutiveBrokenScanCount={}, visitedPageCount={}, "
+                        + "failedPageCount={}, healthyPageCount={}, offerSignalPageCount={}",
+                title, consecutiveEmptyScanCount, consecutiveBrokenScanCount, visitedPageCount, failedPageCount,
+                healthyPageCount, offerSignalPageCount);
         sendTextEmail(title, text, "monitor health");
         sendDesktopNotification(title, "连续多轮没有解析到 VMRack 套餐，可能网站结构变了，需要检查监控代码。");
     }
 
-    private String buildHealthAlertText(int visitedPageCount, int failedPageCount) {
+    private String buildHealthAlertText(int visitedPageCount, int failedPageCount,
+                                        int healthyPageCount, int offerSignalPageCount) {
         return "VMRack 监控连续多轮出现异常，可能是网站结构大改、Cloudflare 拦截，或页面渲染/解析规则失效。"
                 + System.lineSeparator()
                 + System.lineSeparator()
@@ -690,6 +754,8 @@ public class VmRackStockMonitorTask {
                 + "连续抓取异常次数：" + consecutiveBrokenScanCount + System.lineSeparator()
                 + "本轮访问页面数：" + visitedPageCount + System.lineSeparator()
                 + "本轮失败页面数：" + failedPageCount + System.lineSeparator()
+                + "本轮正常 VMRack 页面数：" + healthyPageCount + System.lineSeparator()
+                + "本轮疑似套餐/价格页面数：" + offerSignalPageCount + System.lineSeparator()
                 + "空结果告警阈值：" + healthEmptyScanThreshold + System.lineSeparator()
                 + "单轮页面失败阈值：" + healthPageFailureThreshold + System.lineSeparator()
                 + "连续失败告警阈值：" + healthBrokenScanThreshold + System.lineSeparator()
@@ -697,17 +763,6 @@ public class VmRackStockMonitorTask {
                 + "提醒时间：" + LocalDateTime.now().format(DATE_TIME_FORMATTER) + System.lineSeparator()
                 + System.lineSeparator()
                 + "建议：登录服务器查看日志中的 'VMRack page scan failed'，然后让 Codex 根据最新页面改解析逻辑。";
-    }
-
-    private String buildDediRockEmailText(DediRockStockStatus status) {
-        return "DediRock 216 页面当前不是缺货状态，可能可以下单："
-                + System.lineSeparator()
-                + System.lineSeparator()
-                + "状态：" + status.status + System.lineSeparator()
-                + "页面：" + status.sourceUrl + System.lineSeparator()
-                + "标题：" + status.title + System.lineSeparator()
-                + "片段：" + status.context + System.lineSeparator()
-                + "提醒时间：" + LocalDateTime.now().format(DATE_TIME_FORMATTER) + System.lineSeparator();
     }
 
     private String buildEmailText(List<CheapServerOffer> offers) {
@@ -734,6 +789,33 @@ public class VmRackStockMonitorTask {
         content.append(System.lineSeparator())
                 .append("阈值：月付 <= $").append(maxMonthlyUsd)
                 .append("，年付 <= $").append(maxYearlyUsd).append(System.lineSeparator())
+                .append("提醒时间：").append(LocalDateTime.now().format(DATE_TIME_FORMATTER))
+                .append(System.lineSeparator());
+        return content.toString();
+    }
+
+    private String buildActivityEmailText(List<ActivityCandidate> activities) {
+        StringBuilder content = new StringBuilder();
+        content.append("VMRack 监控发现疑似新活动/优惠页面：").append(System.lineSeparator())
+                .append(System.lineSeparator());
+
+        for (ActivityCandidate activity : activities) {
+            content.append("- ")
+                    .append(activity.title)
+                    .append("，状态：")
+                    .append(activity.status)
+                    .append(System.lineSeparator())
+                    .append("  页面：")
+                    .append(activity.sourceUrl)
+                    .append(System.lineSeparator())
+                    .append("  片段：")
+                    .append(shorten(activity.context, 260))
+                    .append(System.lineSeparator());
+        }
+
+        content.append(System.lineSeparator())
+                .append("说明：这是活动入口提醒；如果页面里同时出现符合阈值的低价三网精品套餐，会再发送购买提醒。")
+                .append(System.lineSeparator())
                 .append("提醒时间：").append(LocalDateTime.now().format(DATE_TIME_FORMATTER))
                 .append(System.lineSeparator());
         return content.toString();
@@ -803,14 +885,20 @@ public class VmRackStockMonitorTask {
         }
     }
 
-    private void openUrl(String url) {
-        if (!openBrowserOnStock || !isMac() || !StringUtils.hasText(url)) {
+    private void openActivityPages(List<ActivityCandidate> activities) {
+        if (!openBrowserOnStock || !isMac()) {
             return;
         }
-        try {
-            new ProcessBuilder("open", url).start();
-        } catch (IOException ex) {
-            log.warn("Browser open failed for {}: {}", url, ex.getMessage());
+        Set<String> urls = activities.stream()
+                .map(activity -> activity.sourceUrl)
+                .filter(StringUtils::hasText)
+                .collect(Collectors.toCollection(LinkedHashSet::new));
+        for (String url : urls) {
+            try {
+                new ProcessBuilder("open", url).start();
+            } catch (IOException ex) {
+                log.warn("VMRack activity browser open failed for {}: {}", url, ex.getMessage());
+            }
         }
     }
 
@@ -825,9 +913,21 @@ public class VmRackStockMonitorTask {
         return new ArrayList<>(deduped.values());
     }
 
+    private static List<ActivityCandidate> dedupeActivities(List<ActivityCandidate> activities) {
+        Map<String, ActivityCandidate> deduped = new LinkedHashMap<>();
+        for (ActivityCandidate activity : activities) {
+            ActivityCandidate existing = deduped.get(activity.uniqueKey());
+            if (existing == null || (!existing.active && activity.active)) {
+                deduped.put(activity.uniqueKey(), activity);
+            }
+        }
+        return new ArrayList<>(deduped.values());
+    }
+
     private Set<String> configuredSeedUrls() {
         return csvToList(seedUrls).stream()
                 .map(String::trim)
+                .map(this::normalizeSameSiteUrl)
                 .filter(StringUtils::hasText)
                 .collect(Collectors.toCollection(LinkedHashSet::new));
     }
@@ -836,12 +936,117 @@ public class VmRackStockMonitorTask {
         return csvToList(premiumKeywords);
     }
 
+    private boolean isSameSiteSitemapUrl(String url) {
+        if (!StringUtils.hasText(url)) {
+            return false;
+        }
+        URI base = URI.create(baseUrl);
+        URI uri;
+        try {
+            uri = URI.create(url.split("#")[0]);
+        } catch (IllegalArgumentException ex) {
+            return false;
+        }
+        if (!uri.isAbsolute()) {
+            uri = base.resolve(uri);
+        }
+        if (uri.getHost() == null || !base.getHost().equalsIgnoreCase(uri.getHost())) {
+            return false;
+        }
+        String path = uri.getPath();
+        return path != null && path.toLowerCase(Locale.ROOT).contains("sitemap");
+    }
+
+    private String normalizeSameSiteUrl(String url) {
+        if (!StringUtils.hasText(url)) {
+            return "";
+        }
+        URI base = URI.create(baseUrl);
+        URI uri;
+        try {
+            uri = URI.create(url.split("#")[0]);
+        } catch (IllegalArgumentException ex) {
+            return "";
+        }
+        if (!uri.isAbsolute()) {
+            uri = base.resolve(uri);
+        }
+        if (uri.getHost() == null || !base.getHost().equalsIgnoreCase(uri.getHost())) {
+            return "";
+        }
+        String path = uri.getPath();
+        if (path == null || !path.startsWith("/zh-CN")) {
+            return "";
+        }
+        return uri.toString();
+    }
+
+    private boolean isActivityPath(String value) {
+        if (!StringUtils.hasText(value)) {
+            return false;
+        }
+        String lowerValue = value.toLowerCase(Locale.ROOT);
+        for (String keyword : csvToList(activityPathKeywords)) {
+            if (lowerValue.contains(keyword.toLowerCase(Locale.ROOT))) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private static String pageTitle(Document document) {
+        String title = normalize(document.title());
+        if (StringUtils.hasText(title)) {
+            return title;
+        }
+        Element h1 = document.selectFirst("h1");
+        if (h1 != null && StringUtils.hasText(h1.text())) {
+            return normalize(h1.text());
+        }
+        return "VMRack 活动页面";
+    }
+
+    private static boolean pageLooksHealthy(RenderedPage page) {
+        String text = searchableText(page.document);
+        return containsAnyToken(text, Arrays.asList("VMRack", "云服务器", "VPS", "CN2 GIA", "对象存储"));
+    }
+
+    private static boolean pageHasOfferSignals(RenderedPage page) {
+        String text = searchableText(page.document);
+        return hasPositivePrice(text)
+                && containsAnyToken(text, Arrays.asList("VMRack", "VPS", "云服务器", "CN2 GIA", "三网精品"))
+                && looksLikeConcreteServerOffer(text);
+    }
+
+    private static String searchableText(Document document) {
+        StringBuilder text = new StringBuilder(document.text());
+        for (Element meta : document.select("meta[content]")) {
+            text.append(' ').append(meta.attr("content"));
+        }
+        for (Element script : document.select("script[type=application/json], script#__NUXT_DATA__")) {
+            text.append(' ').append(script.data());
+        }
+        return normalize(text.toString());
+    }
+
     private static boolean looksLikeServerOffer(String text) {
         return containsAnyToken(text, Arrays.asList("VPS", "云服务器", "vCPU", "CPU", "内存", "带宽"));
     }
 
+    private static boolean looksLikeConcreteServerOffer(String text) {
+        return LEVEL_SERVER_NAME_PATTERN.matcher(text).find()
+                || CPU_MEMORY_PLAN_PATTERN.matcher(text).find()
+                || (containsAnyToken(text, Arrays.asList("vCPU", "CPU"))
+                && containsAnyToken(text, Arrays.asList("内存", "RAM", "Memory", "GB"))
+                && containsAnyToken(text, Arrays.asList("VPS", "云服务器", "带宽", "流量", "Bandwidth", "Traffic")));
+    }
+
     private static boolean hasPrice(String text) {
         return PRICE_PATTERN.matcher(text).find();
+    }
+
+    private static boolean hasPositivePrice(String text) {
+        return firstPositivePrice(text) != null;
     }
 
     private static boolean isPremium(String text, List<String> premiumKeywords) {
@@ -871,15 +1076,17 @@ public class VmRackStockMonitorTask {
         return "VMRack 云服务器";
     }
 
-    private static Price firstPrice(String text) {
+    private static Price firstPositivePrice(String text) {
         Matcher matcher = PRICE_PATTERN.matcher(text);
-        if (!matcher.find()) {
-            return null;
+        while (matcher.find()) {
+            double amount = Double.parseDouble(matcher.group(1));
+            if (amount <= 0.01) {
+                continue;
+            }
+            PricePeriod period = PricePeriod.from(matcher.group(2));
+            return new Price(matcher.group().replaceAll("\\s+", ""), amount, period);
         }
-
-        double amount = Double.parseDouble(matcher.group(1));
-        PricePeriod period = PricePeriod.from(matcher.group(2));
-        return new Price(matcher.group().replaceAll("\\s+", ""), amount, period);
+        return null;
     }
 
     private static List<String> csvToList(String value) {
@@ -943,6 +1150,16 @@ public class VmRackStockMonitorTask {
         }
     }
 
+    static class ScanResult {
+        private final List<CheapServerOffer> offers;
+        private final List<ActivityCandidate> activities;
+
+        ScanResult(List<CheapServerOffer> offers, List<ActivityCandidate> activities) {
+            this.offers = offers;
+            this.activities = activities;
+        }
+    }
+
     static class CheapServerOffer {
         private final String name;
         private final String priceText;
@@ -990,36 +1207,27 @@ public class VmRackStockMonitorTask {
         }
     }
 
-    static class DediRockStockStatus {
+    static class ActivityCandidate {
         private final String title;
-        private final String status;
         private final String sourceUrl;
+        private final String status;
         private final String context;
-        private final boolean validPage;
-        private final boolean outOfStock;
-        private final boolean available;
+        private final boolean active;
 
-        DediRockStockStatus(String title, String status, String sourceUrl, String context,
-                            boolean validPage, boolean outOfStock, boolean available) {
+        ActivityCandidate(String title, String sourceUrl, String status, String context, boolean active) {
             this.title = title;
-            this.status = status;
             this.sourceUrl = sourceUrl;
+            this.status = status;
             this.context = context;
-            this.validPage = validPage;
-            this.outOfStock = outOfStock;
-            this.available = available;
+            this.active = active;
         }
 
-        boolean isValidPage() {
-            return validPage;
+        boolean isActive() {
+            return active;
         }
 
-        boolean isOutOfStock() {
-            return outOfStock;
-        }
-
-        boolean isAvailable() {
-            return available;
+        String uniqueKey() {
+            return sourceUrl;
         }
     }
 

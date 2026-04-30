@@ -14,10 +14,6 @@ class VmRackStockMonitorTaskTest {
     private static final String EXCLUDE_KEYWORDS = "三网优化,美国原生,Global BGP,Platinum,163/10099/CMI,Cogent/Arelion";
     private static final String SOLD_OUT_KEYWORDS = "已售罄,售罄,Sold Out,Sold out,活动结束,已结束,结束";
     private static final String BUYABLE_KEYWORDS = "库存紧张,低库存,购买,购买并部署,立即使用,Buy,Deploy,Low Stock";
-    private static final String DEDIROCK_OUT_OF_STOCK_KEYWORDS =
-            "Out of Stock,out of stock,缺货,售罄,暂停下单,orders for it have been suspended";
-    private static final String DEDIROCK_VALID_PAGE_KEYWORDS =
-            "Shopping Cart,DediRock,Configure,Checkout,Order Summary";
 
     @Test
     void parseCheapServerOffersFindsBuyablePremiumDeployRow() {
@@ -88,38 +84,50 @@ class VmRackStockMonitorTaskTest {
     }
 
     @Test
-    void parseDediRockStockStatusTreatsOutOfStockAsUnavailable() {
-        String html = "<html><head><title>Shopping Cart - DediRock</title></head><body>"
-                + "<div class='alert alert-danger'>Out of Stock</div>"
-                + "<p>orders for it have been suspended until more stock is available.</p>"
+    void parseCheapServerOffersReadsNuxtJsonPayload() {
+        String html = "<html><head>"
+                + "<meta name='description' content='VMRack CN2 GIA 三网精品 VPS 购买'>"
+                + "</head><body>"
+                + "<script type='application/json' id='__NUXT_DATA__'>"
+                + "[\"三网精品 L3.VPS.1C2G.Base 1 vCPU 2 GB 内存 1000GB 流量 库存紧张 $7.99/月\"]"
+                + "</script>"
                 + "</body></html>";
 
-        VmRackStockMonitorTask.DediRockStockStatus status = VmRackStockMonitorTask.parseDediRockStockStatus(
+        List<VmRackStockMonitorTask.CheapServerOffer> offers = VmRackStockMonitorTask.parseCheapServerOffers(
                 html,
-                "https://dedirock.cn/a/216",
-                DEDIROCK_OUT_OF_STOCK_KEYWORDS,
-                DEDIROCK_VALID_PAGE_KEYWORDS);
+                "https://www.vmrack.net/zh-CN/deploy-new-instance/vps-hosting",
+                PREMIUM_KEYWORDS,
+                EXCLUDE_KEYWORDS,
+                SOLD_OUT_KEYWORDS,
+                BUYABLE_KEYWORDS,
+                20,
+                80);
 
-        assertTrue(status.isValidPage());
-        assertTrue(status.isOutOfStock());
-        assertFalse(status.isAvailable());
+        assertEquals(1, offers.size());
+        assertEquals("L3.VPS.1C2G.Base", offers.get(0).getName());
+        assertTrue(offers.get(0).isQualified());
     }
 
     @Test
-    void parseDediRockStockStatusTreatsValidNonOutOfStockPageAsAvailable() {
-        String html = "<html><head><title>Shopping Cart - DediRock</title></head><body>"
-                + "<h1>Configure</h1>"
-                + "<button>Checkout</button>"
+    void parseCheapServerOffersIgnoresZeroPriceDocsNoise() {
+        String html = "<html><head>"
+                + "<meta name='description' content='VMRack CN2 GIA VPS 购买'>"
+                + "</head><body>"
+                + "<script type='application/json' id='__NUXT_DATA__'>"
+                + "[\"VMRack 云服务器 VPS 产品文档 CN2 GIA display price $0.00 CPU 内存 带宽\"]"
+                + "</script>"
                 + "</body></html>";
 
-        VmRackStockMonitorTask.DediRockStockStatus status = VmRackStockMonitorTask.parseDediRockStockStatus(
+        List<VmRackStockMonitorTask.CheapServerOffer> offers = VmRackStockMonitorTask.parseCheapServerOffers(
                 html,
-                "https://dedirock.cn/a/216",
-                DEDIROCK_OUT_OF_STOCK_KEYWORDS,
-                DEDIROCK_VALID_PAGE_KEYWORDS);
+                "https://www.vmrack.net/zh-CN/pricing",
+                PREMIUM_KEYWORDS,
+                EXCLUDE_KEYWORDS,
+                SOLD_OUT_KEYWORDS,
+                BUYABLE_KEYWORDS,
+                20,
+                80);
 
-        assertTrue(status.isValidPage());
-        assertFalse(status.isOutOfStock());
-        assertTrue(status.isAvailable());
+        assertTrue(offers.isEmpty());
     }
 }
