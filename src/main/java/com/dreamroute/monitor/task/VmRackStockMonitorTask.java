@@ -208,7 +208,7 @@ public class VmRackStockMonitorTask {
             }
 
             remember(offers);
-            checkDediRockStock();
+//            checkDediRockStock();
         } catch (Exception ex) {
             log.warn("VMRack cheap server monitor failed: {}", ex.getMessage(), ex);
         }
