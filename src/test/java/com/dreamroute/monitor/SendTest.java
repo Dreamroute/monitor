@@ -9,7 +9,10 @@ import org.springframework.test.context.ActiveProfiles;
 
 import javax.annotation.Resource;
 
-@SpringBootTest(properties = "vmrack.stock-monitor.enabled=false")
+@SpringBootTest(properties = {
+        "vmrack.stock-monitor.enabled=false",
+        "evoxt.price-monitor.enabled=false"
+})
 @ActiveProfiles("local")
 @EnabledIfSystemProperty(named = "send.mail.test", matches = "true")
 class SendTest {
