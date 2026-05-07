@@ -45,6 +45,9 @@ public class EvoxtPriceMonitorTask {
     private static final Pattern TRANSFER_PATTERN = Pattern.compile(
             "([0-9]+(?:\\.[0-9]+)?)\\s*(TB|GB)",
             Pattern.CASE_INSENSITIVE);
+    private static final Pattern PLAN_SIZE_PATTERN = Pattern.compile(
+            "^VM-([0-9]+(?:\\.[0-9]+)?)$",
+            Pattern.CASE_INSENSITIVE);
 
     private final HttpClient httpClient;
     private final JavaMailSender javaMailSender;
@@ -58,6 +61,9 @@ public class EvoxtPriceMonitorTask {
 
     @Value("${evoxt.price-monitor.series-name:Malaysia (Premium)}")
     private String seriesName;
+
+    @Value("${evoxt.price-monitor.max-plan-name:VM-1.5}")
+    private String maxPlanName;
 
     @Value("${evoxt.price-monitor.request-timeout-ms:15000}")
     private long requestTimeoutMs;
@@ -103,21 +109,29 @@ public class EvoxtPriceMonitorTask {
                 return;
             }
 
+            List<EvoxtPlanPrice> targetPrices = filterTargetPlans(prices, maxPlanName);
+            if (targetPrices.isEmpty()) {
+                log.warn("Evoxt monitor: no target {} prices at or below {} parsed from {}",
+                        seriesName, maxPlanName, url);
+                return;
+            }
+
             if (lastSnapshot.isEmpty()) {
-                remember(prices);
-                log.info("Evoxt monitor initialized: {} {} prices, cheapest {}", seriesName, prices.size(),
-                        prices.stream()
+                remember(targetPrices);
+                log.info("Evoxt monitor initialized: {} {} target prices at or below {}, cheapest {}",
+                        seriesName, targetPrices.size(), maxPlanName,
+                        targetPrices.stream()
                                 .min((left, right) -> Double.compare(left.priceAmount, right.priceAmount))
                                 .map(EvoxtPlanPrice::summary)
                                 .orElse("unknown"));
                 return;
             }
 
-            List<PriceDrop> drops = findPriceDrops(lastSnapshot, prices);
+            List<PriceDrop> drops = findPriceDrops(lastSnapshot, targetPrices);
             if (!drops.isEmpty()) {
                 sendAlert(drops);
             }
-            remember(prices);
+            remember(targetPrices);
         } catch (Exception ex) {
             log.warn("Evoxt price monitor failed: {}", ex.getMessage(), ex);
         }
@@ -193,6 +207,12 @@ public class EvoxtPriceMonitorTask {
         return drops;
     }
 
+    static List<EvoxtPlanPrice> filterTargetPlans(List<EvoxtPlanPrice> prices, String maxPlanName) {
+        return prices.stream()
+                .filter(price -> isPlanAtOrBelow(price.planName, maxPlanName))
+                .collect(Collectors.toList());
+    }
+
     private void remember(List<EvoxtPlanPrice> prices) {
         lastSnapshot.clear();
         for (EvoxtPlanPrice price : prices) {
@@ -265,7 +285,9 @@ public class EvoxtPriceMonitorTask {
         }
 
         content.append(System.lineSeparator())
-                .append("说明：价格下降，或者同价格下月流量增加，都会触发提醒。首次启动只记录基准价格，不会误报。")
+                .append("说明：只监控 ")
+                .append(maxPlanName)
+                .append(" 及以下套餐。价格下降，或者同价格下月流量增加，都会触发提醒。首次启动只记录基准价格，不会误报。")
                 .append(System.lineSeparator())
                 .append("提醒时间：")
                 .append(LocalDateTime.now().format(DATE_TIME_FORMATTER))
@@ -347,6 +369,23 @@ public class EvoxtPriceMonitorTask {
             return amount * 1000;
         }
         return amount;
+    }
+
+    private static boolean isPlanAtOrBelow(String planName, String maxPlanName) {
+        Double planSize = parsePlanSize(planName);
+        Double maxPlanSize = parsePlanSize(maxPlanName);
+        return planSize != null && maxPlanSize != null && planSize <= maxPlanSize + 0.0001;
+    }
+
+    private static Double parsePlanSize(String planName) {
+        if (!StringUtils.hasText(planName)) {
+            return null;
+        }
+        Matcher matcher = PLAN_SIZE_PATTERN.matcher(planName.trim());
+        if (!matcher.find()) {
+            return null;
+        }
+        return Double.parseDouble(matcher.group(1));
     }
 
     private static String normalize(String text) {

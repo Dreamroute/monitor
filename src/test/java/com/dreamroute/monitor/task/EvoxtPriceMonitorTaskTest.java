@@ -76,6 +76,23 @@ class EvoxtPriceMonitorTaskTest {
         assertTrue(drops.isEmpty());
     }
 
+    @Test
+    void filterTargetPlansKeepsVmOnePointFiveAndBelowOnly() {
+        List<EvoxtPriceMonitorTask.EvoxtPlanPrice> targetPlans = EvoxtPriceMonitorTask.filterTargetPlans(
+                List.of(
+                        plan("VM-0.5", "150 GB", 3.49),
+                        plan("VM-1", "300 GB", 5.99),
+                        plan("VM-1.5", "300 GB", 6.95),
+                        plan("VM-2", "600 GB", 11.99),
+                        plan("VM-4", "1000 GB", 23.99)),
+                "VM-1.5");
+
+        assertEquals(3, targetPlans.size());
+        assertEquals("VM-0.5", targetPlans.get(0).getPlanName());
+        assertEquals("VM-1", targetPlans.get(1).getPlanName());
+        assertEquals("VM-1.5", targetPlans.get(2).getPlanName());
+    }
+
     private static EvoxtPriceMonitorTask.EvoxtPlanPrice plan(String name, String transfer, double price) {
         return new EvoxtPriceMonitorTask.EvoxtPlanPrice(
                 name,
